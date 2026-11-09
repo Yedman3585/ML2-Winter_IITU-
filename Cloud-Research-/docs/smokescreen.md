@@ -1,0 +1,594 @@
+# Scenario v2: a Flood as a Smokescreen (screening)
+
+Code: [`smokescreen.py`](../src/fogids/smokescreen.py), tests
+[`test_smokescreen.py`](../tests/test_smokescreen.py), screening
+[`scripts/screen_smokescreen.py`](../scripts/screen_smokescreen.py), configs
+`configs/ids-place-smokescreen.json` (x1) and `-x3.json`.
+
+## Why
+
+On the calibrated scenario, simple rules are already within 0.2–0.3 points of the
+fluid bound (`ps-model.md`), so no method can win much there. Two measurements make a
+harder scenario realistic rather than tuned (`calibration.md`):
+
+- feature extraction costs 7–8 µs per packet on an M2 (dpkt), 6–60 times the inference
+  of a record; a DDoS burst offers a Pi-class gateway about eleven times the packets
+  it can parse, so an IDS under a flood must analyse only a share of the traffic;
+- with only every s-th flow analysed, the context model keeps its per-flow quality, so
+  sampling acts through coverage only.
+
+Attackers exploit exactly this: a flood saturates the monitor while a low-rate attack
+(reconnaissance, brute force, web) slips through.
+
+## Model
+
+Changes with respect to IDS-PLACE (details in the module docstring):
+
+- a cheap header pass splits every window into a *flood* stream (heavy hitters) and a
+  *residual* stream, with 2 % errors both ways; each stream is cut into tasks;
+- extraction is CPU work: 0.06 MI per analysed packet (7.5 µs at 8000 MIPS) plus
+  0.0004 MI per packet for the header pass; 10 packets per benign or low-rate flow,
+  100 per flood flow (CICIoT2023 `Number`);
+- a decision is (node, model, fraction f ∈ {1, 0.5, 0.2, 0.05, 0.01}, extraction
+  site): features extracted at the gateway and shipped, or sampled raw packets shipped
+  and extracted at the fog or cloud node; f = 0 drops the task;
+- a task containing a_c flows of class c is detected with probability
+  1 − (1 − f r_c)^(a_c) if it finishes by its deadline; analysed benign flows raise
+  false alerts at the model's rate;
+- objective: macro-averaged missed detection over attack classes, plus 0.05 × false
+  alerts per benign flow.
+
+Traffic (medium topology: 4 fogs × 8 Pi-class gateways): benign 300 flows/s per
+gateway; a DDoS flood on 12 gateways (15–40 s) and a DoS flood on 8 others (42–54 s) at
+CICIoT2023 class ratios; low-rate recon (40 flows/s), web and brute force (15 flows/s)
+on 6 gateways each, 10–56 s, half of them under a flood. The x3 variant triples the
+benign and flood rates; low-rate attacks stay low-rate.
+
+The simulator is event-driven with processor-sharing CPUs and FIFO uplinks, the
+semantics of the iFogSim driver (`ps-model.md`); it is checked against the
+processor-sharing closed form. The bound is the fluid LP of `bounds.py` over all
+options, solved per fog subtree (cloud CPU unconstrained) or, for x3, per gateway (only
+the gateway's CPU and uplink constrained); both are valid lower bounds, the second
+looser.
+
+## Reference policies
+
+| Policy | Rule |
+|---|---|
+| `no-shed` | f = 1, features at the gateway, risk-split placement |
+| `uniform-shed` | classic load shedding: per gateway and epoch, the largest common f with which every task is predicted to meet its deadline |
+| `greedy-v2` | `ps-greedy-s0.1` over the new options: highest risk first, largest f, then best model, earliest predicted finish; else drop |
+| `stream-aware` | expert rule against smokescreens: flood tasks at the smallest f with the light model at the gateway, residual tasks as `greedy-v2` |
+| `stream-aware-forecast` | as `stream-aware`, plus the gateway's next window (assumed equal to this one) as phantom work |
+| `value-greedy` | myopic value maximiser: best estimated detection value per gateway CPU |
+
+## Screening, seed 1
+
+| Policy | x1: objective | x1: missed low-rate / flood | x3: objective | x3: missed low-rate / flood |
+|---|---|---|---|---|
+| fluid bound | **0.002** (fog subtree) | 0.001 / 0.000 | **0.046** (per gateway) | 0.005 / 0.102 |
+| `no-shed` | 0.711 | 0.526 / 0.980 | — | — |
+| `uniform-shed` | 0.212 | 0.289 / 0.084 | 0.652 | 0.429 / 0.975 |
+| `greedy-v2` | 0.147 | 0.046 / 0.284 | **0.370** | 0.151 / 0.684 |
+| `stream-aware` | **0.014** | 0.009 / 0.006 | 0.488 | 0.209 / 0.893 |
+| `stream-aware-forecast` | — | — | 0.487 | 0.207 / 0.893 |
+| `value-greedy` | 0.414 | 0.271 / 0.625 | 0.605 | 0.541 / 0.699 |
+
+Reading:
+
+1. **x1 fails the screening criterion.** Generic rules are far from the bound, but the
+   expert rule `stream-aware` is within 1.2 points of it: once heavy hitters are
+   separated, sampling the flood to 1 % and analysing the rest fully is nearly
+   optimal. A new method could not beat that rule by a meaningful margin.
+2. **x3 passes, with a caveat.** Every rule misses 15–54 % of low-rate attack tasks and
+   68–98 % of flood tasks; the best (`greedy-v2`, 0.370) is 32 points above the bound.
+   The expert rule breaks: all flood chunks of a window arrive together, and under
+   processor sharing even at f = 1 % (40 MI header pass + 60 MI extraction each)
+   fifteen of them finish together after about 0.6 s, past their 0.3 s deadline. The
+   persistence forecast does not help because the failure is within the window, not
+   across windows.
+3. **The bound is optimistic here.** The fluid LP ignores processor sharing (it can
+   serve work in any order) and, for x3, the fog's capacity. Under processor sharing,
+   meeting the deadlines needs a split of each window's flood chunks between
+   extraction at the gateway, raw-packet offload to the fog (FIFO uplink) and dropping,
+   with the residual tasks fitted in between: a coupled assignment whose exact cost is
+   the processor-sharing min-form of the epoch QUBO. How much of the 32 points is
+   attainable is not known yet; the epoch QUBO on x3 is the test.
+
+## Held-out seeds 2–6
+
+Same configurations, seeds 2–6 (the scenario was designed on seed 1); bound per gateway
+(only the gateway's CPU and uplink constrained) for both loads; mean ± 95 % Student-t
+half-width over seeds. Missed shares are per task containing the class.
+
+| Policy | x1: objective | x1: missed low-rate / flood | x3: objective | x3: missed low-rate / flood |
+|---|---|---|---|---|
+| fluid bound (per gateway) | **0.002 ± 0.000** | 0.001 / 0.000 | **0.047 ± 0.001** | 0.005 / 0.105 |
+| `no-shed` | 0.714 ± 0.003 | 0.528 / 0.982 | — | — |
+| `uniform-shed` | 0.213 ± 0.001 | 0.289 / 0.085 | 0.648 ± 0.005 | 0.421 / 0.977 |
+| `greedy-v2` | 0.167 ± 0.012 | 0.051 / 0.326 | **0.386 ± 0.007** | 0.163 / 0.708 |
+| `stream-aware` | **0.010 ± 0.001** | 0.004 / 0.003 | 0.488 ± 0.010 | 0.208 / 0.896 |
+| `stream-aware-forecast` | 0.010 ± 0.001 | 0.004 / 0.003 | 0.489 ± 0.011 | 0.208 / 0.896 |
+| `value-greedy` | 0.402 ± 0.009 | 0.272 / 0.594 | 0.594 ± 0.013 | 0.514 / 0.712 |
+
+The seed-1 picture holds on every held-out seed, with the same ranking: at x1 the
+expert rule is within 0.8 points of the bound; at x3 the best rule (`greedy-v2`) is
+33.9 points above it, missing 16 % of low-rate attack tasks and 71 % of flood tasks,
+and the persistence forecast changes nothing. The x3 scenario is the one on which the
+epoch QUBO has to show what part of that gap is attainable under processor sharing.
+
+## Joint epoch optimisation (x3)
+
+Code: [`smokescreen_qubo.py`](../src/fogids/smokescreen_qubo.py), tests
+[`test_smokescreen_qubo.py`](../tests/test_smokescreen_qubo.py).
+
+Two epoch models, both annealed for 50 ms per epoch and checked and repaired against
+the processor-sharing estimator:
+
+- `qubo-smoke`: the qubo-ps energy extended to the new options (value of an option
+  minus the processor-sharing sum of deadline-normalised finish times). It was worse
+  than `greedy-v2` on seed 1 for every weight tried (0.43–0.56): a finish-time penalty
+  charges every job, not only those that miss, so it either drops floods or starves the
+  residual stream.
+- `ps-anneal`: the same processor-sharing rows used as **deadline constraints**. A job's
+  predicted latency is the sum over its stages of ``sum_p min(a_o, a_p)`` (the QUBO
+  row); it earns its value only if that fits its budget, and lateness is penalised
+  (kappa = 2). Jobs already committed are fixed members of the model. Parameters chosen
+  on seed 1 (kappa ∈ {2, 5}, prior of 3, 5 or 10 attack flows per task).
+
+Option values are scheduler-visible: detection probability with the attack-flow count
+estimated from the pre-filter score (at least 5 flows, since a low-rate attack hides
+below the score's noise), the value of a flood window shared among its chunks. As a
+reference, `ps-anneal-oracle-value` uses each option's exact contribution to the
+objective (ground truth), everything else unchanged.
+
+Seeds 2–6, x3, means:
+
+| Policy | Objective | Missed low-rate | Missed flood | Decision, ms |
+|---|---|---|---|---|
+| fluid bound (per gateway) | 0.047 | 0.005 | 0.105 | — |
+| `greedy-v2` | 0.386 | 0.163 | 0.708 | — |
+| `ps-anneal` | **0.366** | 0.235 | **0.550** | 56 |
+| `ps-anneal-oracle-value` | **0.290** | 0.110 | 0.555 | 57 |
+
+Paired against `greedy-v2`, `ps-anneal` is better on every seed (−2.0 points on
+average, from −0.1 to −4.3). Reading:
+
+1. **Joint placement under processor sharing works on the part it can see.** It detects
+   16 points more flood tasks than the greedy rule: the window's chunks are split
+   between gateway extraction, raw offload and dropping so that the kept ones meet
+   their deadlines.
+2. **It loses on low-rate attacks because their value is invisible.** With a pre-filter
+   score dominated by noise, a residual task with a low-rate attack looks like a benign
+   one; the annealer samples it down where the greedy rule, which always tries f = 1
+   first, keeps it whole.
+3. **With the true values the same optimiser reaches 0.290**, 9.6 points better than
+   `greedy-v2`, and misses 11 % of low-rate tasks instead of 16–24 %. The gap between
+   `ps-anneal` and its oracle (7.6 points) is what a better value estimate can win; the
+   gap between the oracle and the fluid bound is mostly the bound's optimism (it ignores
+   processor sharing: flood detection stays at 0.55 even with true values).
+
+The gap between `ps-anneal` and its oracle is therefore informational: the scheduler
+needs a better estimate of which tasks are worth analysing. The next section shows
+that the IDS's own alerts provide it.
+
+## Alert feedback (x3)
+
+The value of a residual task depends on whether it hides a low-rate attack, which the
+pre-filter score cannot tell. An IDS does report something the scheduler can use: the
+alerts it raised in earlier windows. The simulator now samples them for every task
+analysed on time (`Engine._alert`): attack flows of the analysed share are reported in
+their group (flood or low-rate) with the model's recall; analysed benign flows raise a
+low-rate alert at the model's false-positive rate. That every benign misclassification
+of both models falls in the low-rate group is measured on CICIoT2023
+(`scripts/alert_groups.py`: 25.6 % of benign records for `light`, 12.6 % for `full`;
+flood classes are never reported as low-rate).
+
+`AlertEvidence` turns the residual-stream alerts of a gateway over the last 40 s into
+an estimated share of low-rate attack flows: (alerts − false alerts expected if all
+analysed flows were benign) / (analysed flows × mean recall). As a ranking of residual
+tasks with and without a low-rate attack (seed 1, decisions of `greedy-v2`) it reaches
+an AUC of 0.76, against 0.64 for the pre-filter score (0.65 with a 5 s history, 0.73
+with 20 s).
+
+Policies using it: `ps-anneal-alerts` (attack flows of a residual task = max(3, share ×
+flows); floor and horizon chosen on seed 1) and, as a fair baseline with the same
+information, `value-greedy-alerts`. Seeds 2–6, x3:
+
+| Policy | Objective | Missed low-rate | Missed flood |
+|---|---|---|---|
+| `greedy-v2` | 0.386 | 0.163 | 0.708 |
+| `value-greedy-alerts` | 0.321 | 0.144 | 0.575 |
+| `ps-anneal` | 0.366 | 0.235 | 0.550 |
+| **`ps-anneal-alerts`** | **0.289** | **0.086** | 0.578 |
+| `ps-anneal-oracle-value` | 0.290 | 0.110 | 0.555 |
+
+1. **Alert feedback plus joint placement gives the best policy: 0.289**, 9.7 points
+   below `greedy-v2` and 3.2 points below the greedy rule with the same alert
+   information (better on every seed, by 1.9 to 4.8 points).
+2. **The simple statistical estimate already matches the oracle values** (0.289 against
+   0.290 at the same 50 ms budget). In this scenario a learned value model has nothing
+   left to win; what remains is the optimiser and the flood capacity.
+3. **The optimiser is the lever now.** With the oracle values, three times the annealing
+   budget (150 ms) gives 0.249 on seed 1 instead of 0.288: a faster annealer reaches
+   more of it within the 100 ms epoch.
+
+## Faster annealer
+
+`fast_anneal.py` runs the same `EpochPS` model and moves on dense arrays compiled with
+numba: a move updates the latency of every job sharing a resource with the moved task
+by min(a_j, a_k), so it costs O(jobs on the resources involved). About 2.5 million
+moves per second against about 20 thousand in pure Python, i.e. ~120 000 moves in the
+50 ms budget instead of ~1 000. Dominated options (no more value, at least as much load
+on every resource) are removed before annealing (`_pareto`; the processor-sharing and
+FIFO delays are monotone in every load, so this is exact). The kernel's energy is
+checked against the Python model in the tests. Decision time per epoch, including
+building the model and the repair pass: 65–70 ms of the 100 ms epoch.
+
+Seeds 2–6, x3, Python simulator: `ps-anneal` 0.366 → 0.341, `ps-anneal-alerts` 0.289 →
+0.256, `ps-anneal-oracle-value` 0.290 → 0.230. With the oracle values the optimiser now
+leaves the alert-based policy 2.6 points behind: the value estimate matters again once
+the search is good enough.
+
+## Final comparison in iFogSim (x3)
+
+`org.fogids.IdsStaged` executes the staged tasks in iFogSim: a CPU stage on the gateway,
+then optionally a second CPU stage on the gateway or an ancestor, reached over the
+uplinks with the given bytes; work in MI and node MIPS are both scaled by 1000 (tuple
+lengths are integers) and the CPU update interval is 1 ms (deadlines of 0.3 s on
+tightly packed gateways). `smokescreen_ifogsim.simulate_ifogsim` runs a policy against
+it: the policy sees a shadow `Engine` driven by the same decisions and the alerts of
+the tasks iFogSim completed on time; metrics use iFogSim's finish times. On the test
+scenario iFogSim reproduces the Python simulator's finish times within 3 ms and the same
+objective.
+
+Seeds 2–6, x3, metrics from iFogSim (mean ± 95 % half-width; differences paired by
+seed):
+
+| Policy | Objective | Missed low-rate | Missed flood | Decision, ms |
+|---|---|---|---|---|
+| `greedy-v2` | 0.393 ± 0.008 | 0.163 | 0.724 | 41 |
+| `value-greedy-alerts` | 0.330 ± 0.017 | 0.144 | 0.597 | 70 |
+| `ps-anneal` | 0.341 ± 0.011 | 0.217 | 0.518 | 68 |
+| **`ps-anneal-alerts`** | **0.256 ± 0.008** | **0.019** | 0.596 | 67 |
+| `ps-anneal-oracle-value` (Python simulator) | 0.230 | 0.021 | 0.542 | 49 |
+
+`ps-anneal-alerts` is 13.7 points below `greedy-v2` and 7.5 points below the greedy
+rule with the same alert information, better on every seed (by at least 5.7 points),
+and misses 1.9 % of low-rate attack tasks instead of 14–16 %. The scheduler's own
+prediction (shadow) of these runs is within 0.001 of iFogSim's objective; finish times
+differ by 6 ms on average.
+
+## Robustness and ablations (Python simulator, seeds 2–6)
+
+`scripts/robustness.py` changes one parameter of the x3 scenario at a time, or one
+component of `ps-anneal-alerts`; 165 runs. Objective, mean ± 95 % half-width; the last
+column is paired by seed.
+
+| Variant | `greedy-v2` | `value-greedy-alerts` | `ps-anneal-alerts` | `ps-anneal-alerts` − `value-greedy-alerts` |
+|---|---|---|---|---|
+| x3 (base) | 0.386 ± 0.007 | 0.321 ± 0.013 | **0.255 ± 0.008** | −0.066 ± 0.019 |
+| load x2 | 0.309 ± 0.013 | 0.252 ± 0.007 | **0.149 ± 0.010** | −0.103 ± 0.010 |
+| load x5 | 0.456 ± 0.015 | 0.412 ± 0.010 | **0.379 ± 0.007** | −0.033 ± 0.009 |
+| extraction 1 µs/packet | 0.408 ± 0.016 | 0.323 ± 0.019 | **0.088 ± 0.010** | −0.235 ± 0.019 |
+| extraction 3 µs/packet | 0.411 ± 0.012 | 0.347 ± 0.010 | **0.154 ± 0.009** | −0.193 ± 0.006 |
+| separation error 0 % | 0.353 ± 0.005 | 0.285 ± 0.014 | **0.251 ± 0.008** | −0.034 ± 0.015 |
+| separation error 5 % | 0.497 ± 0.015 | 0.421 ± 0.016 | **0.350 ± 0.010** | −0.071 ± 0.016 |
+| large topology (8 × 16 gateways) | 0.378 ± 0.006 | 0.315 ± 0.005 | **0.260 ± 0.003** | −0.055 ± 0.005 |
+
+`ps-anneal-alerts` is the best policy in every variant and on every seed; its margin
+over `greedy-v2` ranges from 5.0 points (worst seed, x5) to 32 points (1 µs per packet).
+The margin is largest when extraction is cheaper (a compiled extractor): the greedy
+rules then spend the freed CPU on flood chunks first, while the epoch model puts it on
+the residual stream. It shrinks at x5, where every policy is capacity-bound, and when
+the streams separate perfectly (the low-rate attacks are then easy for everyone).
+
+Ablations (x3):
+
+| Change | Objective | Missed low-rate | Missed flood | Decision, ms |
+|---|---|---|---|---|
+| none | 0.255 ± 0.008 | 0.018 | 0.597 | 58 |
+| no alerts (`ps-anneal`) | 0.341 ± 0.010 | 0.216 | 0.519 | 60 |
+| no dominance pruning | 0.256 ± 0.008 | 0.018 | 0.598 | 55 |
+| no repair | 0.256 ± 0.008 | 0.018 | 0.599 | 58 |
+| annealing budget 10 ms | 0.258 ± 0.008 | 0.022 | 0.597 | 16 |
+| annealing budget 25 ms | 0.257 ± 0.007 | 0.021 | 0.597 | 32 |
+| annealing budget 100 ms | 0.255 ± 0.008 | 0.016 | 0.599 | 111 |
+| alert window 10 s | 0.255 ± 0.009 | 0.018 | 0.596 | 58 |
+| alert window 20 s | 0.257 ± 0.007 | 0.019 | 0.599 | 58 |
+| oracle values | 0.229 ± 0.005 | 0.018 | 0.540 | 42 |
+
+The two components that matter are the alert-based values (8.6 points) and the
+deadline-exact epoch model (the step from `value-greedy-alerts`, 6.6 points). Pruning,
+repair, the alert window and the annealing budget change less than the seed-to-seed
+noise: with the compiled annealer, 10 ms per epoch already reaches the result, so the
+method needs about 16 ms of the 100 ms epoch. What remains to the oracle (2.6 points)
+is on flood tasks (0.597 against 0.540 missed), not low-rate ones.
+
+## A processor-sharing window bound
+
+`smokescreen_bound.ps_window_bound` relaxes the problem per gateway window: the chosen
+options' first stages share the gateway under processor sharing with only the other
+tasks of their window (jobs of earlier windows, other gateways and downstream contention
+left out), which gives linear big-M constraints sum_j min(a_i, a_j) x_j <= budget_i; each
+window is a small mixed-integer program solved with HiGHS (dual bound when the 5 s limit
+is hit). It is a valid lower bound, but a weak one: on x3, seed 2, it gives 0.006 (1 643
+of 1 888 windows optimal), below the fluid bound (0.048). The per-window plans it finds
+detect 90 % of flood tasks, so processor sharing **within** a window is not what limits
+flood detection; the loss comes from work carried across windows (low-risk tasks with
+2 s deadlines overlapping the next window's flood) and from deciding one epoch at a
+time. The tightest valid bound remains the fluid one (0.047); the best attainable
+reference is the online policy with oracle task values (0.229).
+
+## Overnight runs: 20 seeds, decision time, load curve, robustness in iFogSim
+
+All on an Apple M2 (`scripts/night_runs.sh`, 21 October 2026). Mean ± 95 % half-width;
+differences paired by seed.
+
+**Main comparison, iFogSim, x3, seeds 2–21** (final table for the paper):
+
+| Policy | Objective | Missed low-rate | Missed flood | Decision, ms (mean) |
+|---|---|---|---|---|
+| `greedy-v2` | 0.387 ± 0.004 | 0.159 | 0.714 | 19 |
+| `value-greedy-alerts` | 0.325 ± 0.005 | 0.138 | 0.591 | 33 |
+| `ps-anneal` | 0.342 ± 0.003 | 0.216 | 0.521 | 60 |
+| **`ps-anneal-alerts`** | **0.255 ± 0.003** | **0.017** | 0.597 | 58 |
+| `ps-anneal-oracle-value` (Python simulator) | 0.229 ± 0.002 | 0.019 | 0.540 | — |
+
+`ps-anneal-alerts` − `greedy-v2` = −0.132 ± 0.005 (every seed at least −0.110);
+− `value-greedy-alerts` = −0.070 ± 0.005 (at least −0.057); − `ps-anneal` = −0.087 ±
+0.002. The gap to the oracle values is 0.026 ± 0.001. The scheduler's own model predicts
+iFogSim's objective within 0.0002 for the annealing policies (0.006–0.010 for the
+greedy ones, whose estimator is coarser).
+
+**Decision time charged to the simulated clock** (iFogSim, x3, seeds 2–6; the policies
+plan with the delay they expect):
+
+| Policy | none | fixed 16 ms | fixed 50 ms | measured | decision mean / p95, ms |
+|---|---|---|---|---|---|
+| `greedy-v2` | 0.387 | 0.383 | 0.391 | 0.413 | 17 / 67 |
+| `value-greedy-alerts` | 0.325 | 0.336 | 0.358 | 0.411 | 29 / 107 |
+| `ps-anneal-alerts` (50 ms budget) | 0.255 | 0.267 | 0.292 | 0.300 | 58 / 84 |
+| `ps-anneal-alerts` (10 ms budget) | — | — | — | **0.270** | 16 / 27 |
+
+With its decision time charged, the method keeps a large lead: 0.270 (10 ms annealing
+budget) against 0.413 for `greedy-v2` and 0.411 for `value-greedy-alerts`, whose Python
+decisions take up to 107 ms at the 95th percentile. A 10 ms budget is the better
+operating point online: it loses nothing in quality without charged time (ablations) and
+its decisions stay below 27 ms in 95 % of epochs.
+
+**Load curve** (Python simulator, seeds 2–6): `ps-anneal-alerts` is the best of the three
+policies at every load from x1 to x5; its margin over `greedy-v2` is 8–15 points from x1
+to x3 and narrows to 8 points at x5, where every policy is capacity-bound (figure
+`docs/figures/robustness.png`). At x1 the expert anti-smokescreen rule (`stream-aware`,
+not in this sweep) remains better (0.010, section Screening): at low load the hard part
+is knowing that the flood stream can be sampled to 1 %, which that rule is told.
+
+**Robustness in iFogSim** (seeds 2–6): the Python results carry over.
+
+| Variant | `greedy-v2` | `value-greedy-alerts` | `ps-anneal` | `ps-anneal-alerts` | ours − `greedy-v2` (worst seed) |
+|---|---|---|---|---|---|
+| extraction 1 µs/packet | 0.415 | 0.335 | 0.192 | **0.088** | −0.327 (−0.307) |
+| separation error 5 % | 0.504 | 0.431 | 0.422 | **0.350** | −0.153 (−0.135) |
+| large topology (128 gateways) | 0.384 | 0.325 | 0.354 | **0.259** | −0.124 (−0.118) |
+
+**Training data** for a learned value estimate: seeds 7–26 in `artifacts/value-data/`
+(every epoch model with estimated and oracle option values, task features and
+outcomes; not in git, about 90 MB).
+
+## Baselines from the literature (Python simulator, seeds 2–6)
+
+Code: [`baselines.py`](../src/fogids/baselines.py), tuning
+[`scripts/tune_satoca.py`](../scripts/tune_satoca.py).
+
+- **`sa-toca`** (after Sudyana et al., IEEE TSC 2025): per traffic class (stream ×
+  deadline class) a fixed split over five routes (gateway, fog with features, fog with
+  sampled raw packets, cloud, drop), one model and one sampling fraction, routed by
+  weighted round robin with no run-time feedback. The 4 × 7 parameters are tuned
+  offline by simulated annealing (600 iterations) on x3, training seed 7, with **our
+  objective computed from ground truth** — more favourable to the baseline than the
+  original cost model. Tuned: flood traffic sampled at 1 % with the light model, 60 % of
+  short-deadline flood chunks dropped, much of it sent as raw packets to the fog;
+  residual traffic analysed by the full model mostly at the fog (5–50 % sampling).
+- **`fog-qiea`** (FOG-QIEA style): per epoch, a quantum-inspired evolutionary algorithm
+  (probability vectors over each task's options, rotated toward the best observed
+  solution) with the same option values and deadline rule as `ps-anneal-alerts` but the
+  usual additive contention model; same 50 ms budget and repair. `qiea-ps` is the same
+  algorithm on our processor-sharing model (optimizer swap only).
+
+| Variant | `greedy-v2` | `sa-toca` (tuned at x3) | `fog-qiea` | `qiea-ps` | `ps-anneal-alerts` |
+|---|---|---|---|---|---|
+| x3 (tuning condition) | 0.386 | **0.252** | 0.440 | 0.439 | 0.255 |
+| load x2 | 0.309 | 0.226 | — | — | **0.149** |
+| load x5 | 0.456 | **0.365** | — | — | 0.379 |
+| extraction 1 µs/packet | 0.408 | 0.243 | — | — | **0.088** |
+| separation error 5 % | 0.497 | **0.342** | — | — | 0.350 |
+| large topology | 0.378 | **0.250** | — | — | 0.260 |
+
+1. **A static split tuned offline with ground truth on the deployment condition is as
+   good as the online method there** (x3: 0.252 against 0.255, a tie within noise; it
+   detects slightly more flood tasks and raises half the false alerts) and slightly
+   better under the conditions closest to it (x5, 5 % separation error, larger
+   topology: 0.8–1.4 points).
+2. **It does not adapt.** Where the condition moves away from the tuning point it
+   keeps the x3 shares: at x2 it is 7.7 points worse than the online method, and with a
+   compiled extractor (1 µs/packet) 15.5 points worse. The online method needs no
+   labels and no retuning; the static split needs ground truth and an offline search
+   per condition.
+3. **Generic metaheuristics are not enough.** The QIEA, with the same values and budget,
+   reaches 0.44 with either contention model: in Python it evaluates a few hundred whole
+   solutions per epoch, while the annealer makes about 120 000 incremental moves.
+
+### Per-condition tuning, 20 seeds in iFogSim and a non-stationary scenario
+
+`sa-toca-own` is the static split re-tuned on the evaluated condition itself (same
+search, training seed 7, ground-truth objective), an upper reference for static splits.
+The **drift** scenario changes the load within a run: DDoS x1.5 on gateways 0–7 and
+16–19 during 5–25 s, then DDoS x5 on gateways 8–15 and 24–27 and DoS x5 on gateways
+20–23 during 30–55 s, with low-rate attacks throughout 5–57 s.
+
+| Condition | `greedy-v2` | `sa-toca` (tuned at x3) | `sa-toca-own` | `ps-anneal-alerts` |
+|---|---|---|---|---|
+| x3, iFogSim, 20 seeds | 0.387 ± 0.004 | **0.251 ± 0.002** | — | 0.255 ± 0.003 |
+| load x2, Python | 0.309 | 0.226 | 0.159 ± 0.008 | **0.149 ± 0.010** |
+| extraction 1 µs, Python | 0.408 | 0.243 | 0.140 ± 0.013 | **0.088 ± 0.010** |
+| drift, iFogSim, seeds 2–6 | 0.467 ± 0.019 | 0.356 ± 0.011 | **0.329 ± 0.005** | 0.342 ± 0.007 |
+
+(`fog-qiea` in iFogSim, 20 seeds: 0.438 ± 0.004. Value-greedy with alerts on drift:
+0.405 ± 0.011. Python and iFogSim agree on drift to within 0.007 for every policy.)
+
+1. **x3 over 20 seeds:** the split tuned on this condition is ahead by 0.36 ± 0.18 points
+   (paired). It misses more low-rate attack tasks (2.7 % against 1.7 %) and fewer flood
+   tasks (58 % against 60 %). It also has no decision time; with charged decision time
+   the online method reaches 0.270 (10 ms budget).
+2. **Re-tuning per condition does not make the static split the better method** where
+   the condition differs in kind: at x2 the online method is still 1.0 points better
+   than the re-tuned split, with a 1 µs extractor 5.2 points better. The online method
+   uses the cheaper extraction at run time; a fixed share per class can only partly do so.
+3. **Drift:** the split tuned at x3 is 1.4 ± 1.0 points behind the online method (paired).
+   A split re-tuned on the drift run itself, i.e. with the whole attack schedule and the
+   labels known in advance, is 1.3 ± 0.6 points ahead. This is the cost of reacting to
+   alerts instead of knowing the future; the online method needs neither labels nor the
+   schedule.
+
+Summary for the paper: without labels or retuning the online method matches a static
+split tuned offline with ground truth on the deployment condition, beats it once the
+condition shifts, and stays within about one point of a split tuned with full knowledge of
+a non-stationary attack.
+
+## 20 seeds in iFogSim: drift and oracle values
+
+| Policy | x3 | drift |
+|---|---|---|
+| `greedy-v2` | 0.387 ± 0.004 | 0.458 ± 0.006 |
+| `value-greedy-alerts` | 0.325 ± 0.005 | 0.404 ± 0.004 |
+| `sa-toca` (tuned at x3) | **0.251 ± 0.002** | 0.353 ± 0.004 |
+| `sa-toca-own` (tuned on drift, schedule and labels known) | — | 0.329 ± 0.002 |
+| `ps-anneal-alerts` | 0.255 ± 0.003 | 0.340 ± 0.002 |
+| `ps-anneal-oracle-value` (exact values) | 0.228 ± 0.003 | **0.291 ± 0.002** |
+
+Paired, drift: the online method is 1.3 ± 0.3 points better than the split tuned at x3
+and 1.1 ± 0.3 points behind the split tuned on drift itself; with exact values it is
+3.8 points ahead of that split. Headroom of the value estimate in iFogSim: 2.6 ± 0.1
+points at x3, 4.9 ± 0.2 on drift (same as in Python).
+
+## How much a better value estimate could gain (Python simulator, seeds 2–6)
+
+The only uncertain coefficients in the epoch model are the task values; the load terms are
+exact. `ps-anneal-oracle-value` replaces the alert-based value estimate by the exact value
+from ground truth (each task's own contribution to the objective).
+
+| Condition | `ps-anneal-alerts` | oracle values | headroom, points |
+|---|---|---|---|
+| load x1 | **0.086** | 0.106 | −1.9 ± 0.7 |
+| load x2 | 0.149 | 0.144 | 0.5 ± 0.3 |
+| extraction 1 µs | 0.088 | 0.077 | 1.2 ± 0.4 |
+| large topology | 0.260 | 0.237 | 2.3 ± 0.1 |
+| x3 | 0.255 | 0.230 | 2.5 ± 0.3 |
+| separation error 5 % | 0.350 | 0.306 | 4.4 ± 0.4 |
+| drift | 0.340 | 0.291 | 4.9 ± 0.2 |
+| load x5 | 0.379 | 0.327 | 5.2 ± 0.4 |
+
+The headroom grows with the difficulty of the condition. At x1 exact per-task values are
+**worse** than the alert estimate: values that are correct task by task are not the
+coefficients that give the best decisions (the case for decision-focused learning).
+
+## Learned attack-flow estimate (two-stage)
+
+Plan: [learning-plan.md](learning-plan.md). Code: [`learned.py`](../src/fogids/learned.py),
+[`scripts/train_values.py`](../scripts/train_values.py),
+[`scripts/learned_eval.sh`](../scripts/learned_eval.sh).
+
+The option value of `ps-anneal-alerts` has one unknown per task, the attack flows it
+contains (low-rate flows in a residual task). `ps-anneal-learned` predicts it with
+gradient-boosted trees (Poisson loss) from features visible at decision time: pre-filter
+score, stream, size, deadline, the gateway's alerts, expected false alerts and analysed
+recall over 10, 20 and 40 s. Training data: `ps-anneal-alerts` runs on seeds 7–26 (x3) and
+7–16 (x1, x5, separation 5 %, drift); 538 000 tasks. `-loo` is the model trained without
+the evaluated condition. `ps-anneal-true-a` is the same value formula with the true attack
+flows. Prediction takes about 3 ms per epoch.
+
+Rank correlation with the true low-rate flows of residual tasks (held-out seeds): 0.79–0.84
+for the model against 0.43–0.73 for the alert formula; on an unseen condition 0.46–0.75.
+
+| Condition | `ps-anneal-alerts` | `-learned-loo` | `-learned` | `-true-a` | oracle values |
+|---|---|---|---|---|---|
+| load x1 | **0.086** | 0.092 (+0.6 ± 0.9) | 0.095 (+0.9 ± 1.0) | 0.094 | 0.106 |
+| x3 | 0.255 | 0.250 (−0.5 ± 0.3) | 0.249 (−0.7 ± 0.3) | 0.245 | 0.230 |
+| load x5 | 0.379 | **0.352 (−2.7 ± 0.3)** | 0.355 (−2.4 ± 0.9) | 0.358 | 0.327 |
+| separation error 5 % | 0.350 | 0.330 (−2.0 ± 0.5) | **0.329 (−2.0 ± 0.7)** | 0.330 | 0.306 |
+| drift | 0.340 | **0.322 (−1.8 ± 0.6)** | 0.330 (−1.0 ± 0.4) | 0.337 | 0.291 |
+
+(paired differences against `ps-anneal-alerts` in brackets)
+
+1. The learned estimate helps on every hard condition, also when that condition was not
+   in the training data (it closes 21–51 % of the headroom).
+2. It is as good as the formula with the **true** attack flows: estimating the flows
+   better cannot gain more. The rest of the headroom is in the form of the value
+   (the oracle raises 3–4 times fewer false alerts).
+3. Better prediction is not better decisions: on drift the model trained on all
+   conditions predicts better (0.79 against 0.66) and decides worse (0.330 against 0.322).
+4. Without the floor of 3 attack flows the learned estimate stops analysing tasks that
+   have no alerts yet, which then never raise any (objective 0.71 on one seed): the
+   estimate shapes its own future features.
+
+## Hand tuning against learning (Python simulator, seeds 2–6)
+
+Grid over the false-alert weight of the option value (1e-4, 1e-3, 3e-3, 1e-2, 3e-2) and the
+floor of the attack-flow estimate (3, 1) for the alert formula and for `-learned-loo`
+([`scripts/hand_tuning.sh`](../scripts/hand_tuning.sh)). The best setting is chosen on
+the evaluation seeds themselves, which favours hand tuning.
+
+| Condition | formula, as is | formula, best setting | learned, best setting | learned, one setting (1e-3, 3) | oracle values |
+|---|---|---|---|---|---|
+| x3 | 0.257 | 0.255 (1e-4, 1) | **0.248** | 0.248 | 0.230 |
+| load x5 | 0.379 | **0.344** (1e-2, 3) | **0.343** | 0.343 | 0.327 |
+| separation error 5 % | 0.350 | 0.338 (1e-2, 3) | **0.328** | 0.328 | 0.306 |
+| drift | 0.341 | 0.325 (1e-2, 3) | **0.316** | 0.316 | 0.291 |
+
+1. The false-alert weight 1e-4 used so far is too low for the formula under heavy load;
+   tuning it gains 3.5 points at x5, where it matches the learned estimate.
+2. The learned estimate is about 1 point better than the tuned formula at x3, with 5 %
+   separation error and on drift, with **one** setting for all conditions; the formula
+   needs a different weight at x3 (1e-4) than elsewhere (1e-2). With one setting for the
+   formula (1e-2, 3) the learned estimate is 0.7 points better on average.
+3. The learned estimate with one setting at x3 (0.248) is better than the static split
+   tuned offline with labels on x3 (`sa-toca`, 0.252).
+4. 1.6–2.5 points to the oracle values remain on every condition: the target for
+   decision-focused learning, to be compared with the tuned formula.
+
+## Learned and decision-focused values in iFogSim (20 seeds)
+
+Seeds 2–6 and 27–41 (disjoint from the training seeds 7–26); learned models trained
+without the evaluated condition; [`scripts/night_runs4.sh`](../scripts/night_runs4.sh).
+Paired differences against the learned estimate (weight 1e-3) in brackets.
+
+| Policy | x3 | drift |
+|---|---|---|
+| alert formula, as is | 0.254 ± 0.002 (+0.7 ± 0.1) | 0.341 ± 0.003 (+2.5 ± 0.2) |
+| alert formula, false-alert weight 1e-2 (hand-tuned) | 0.254 ± 0.003 (+0.7 ± 0.2) | 0.325 ± 0.002 (+1.0 ± 0.2) |
+| learned estimate, weight 1e-3 (`-learned-loo`) | 0.247 ± 0.002 | 0.315 ± 0.002 |
+| decision-focused weights (`-dfl-loo`) | **0.245 ± 0.002** (−0.2 ± 0.1) | **0.312 ± 0.002** (−0.3 ± 0.2) |
+| oracle values | 0.228 ± 0.002 | 0.290 ± 0.002 |
+
+Measured decision time charged to the simulated clock (x3, 10 seeds, 10 ms annealing
+budget): alert formula 0.269 ± 0.003 (17 ms per epoch), learned 0.265 ± 0.004 (20 ms),
+decision-focused 0.262 ± 0.004 (20 ms; −0.2 ± 0.2 against learned).
+
+1. Over 20 seeds the decision-focused weights are better than the learned estimate on both
+   conditions, by a small margin (0.2–0.3 points); over 5 seeds in Python the difference
+   was within noise.
+2. The learned estimate is 0.7 (x3) and 1.0 (drift) points better than the alert formula
+   hand-tuned on the evaluation seeds.
+3. The prediction costs about 3 ms per epoch; the gain survives charged decision time.
+4. For reference (other seeds, 2–21): `sa-toca` reaches 0.251 at x3 and the split tuned on
+   drift with its schedule and labels 0.329 on drift; the decision-focused policy is ahead
+   of both.
+5. 1.7–2.2 points to the oracle values remain (information the scheduler does not have).
+
+## Next
+
+- A bound that carries work across windows (the per-window processor-sharing bound
+  shows that within-window sharing is not the binding effect).
+- Whether a learned value estimate closes the 2.6 points between the alert-based
+  estimate and the oracle values.

@@ -1,0 +1,179 @@
+{
+  "profile": "mac",
+  "ref_mips": 8000,
+  "hardware": {
+    "platform": "macOS-13.0-arm64-arm-64bit",
+    "machine": "arm64",
+    "python": "3.12.14",
+    "torch": "2.11.0",
+    "machdep.cpu.brand_string": "Apple M2",
+    "hw.model": "Mac14,2",
+    "hw.memsize": "8589934592"
+  },
+  "threads": 1,
+  "dataset": {
+    "files": 309,
+    "cap_per_label": 20000,
+    "seed": 2023,
+    "features": 39,
+    "rows": 559800,
+    "kept_per_class": {
+      "benign": 20000,
+      "ddos": 240000,
+      "dos": 80000,
+      "mirai": 60000,
+      "recon": 82200,
+      "spoofing": 40000,
+      "web": 24600,
+      "bruteforce": 13000
+    }
+  },
+  "models": [
+    {
+      "name": "light",
+      "fixed_mi": 0.205694,
+      "mi_per_flow": 0.001194,
+      "memory_mb": 5,
+      "load_s": 0.0057,
+      "recall": {
+        "ddos": 1.0,
+        "dos": 1.0,
+        "mirai": 1.0,
+        "recon": 0.8549,
+        "spoofing": 0.8503,
+        "web": 0.8708,
+        "bruteforce": 0.8565
+      },
+      "context": 1,
+      "eval_rho": 0.0,
+      "recall_clean_context": {
+        "ddos": 1.0,
+        "dos": 1.0,
+        "mirai": 1.0,
+        "recon": 0.8549,
+        "spoofing": 0.8503,
+        "web": 0.8708,
+        "bruteforce": 0.8565
+      },
+      "balanced_accuracy_clean_context": 0.7158097743990756,
+      "benign_false_positive_rate_clean_context": 0.25585585585585585,
+      "fit": {
+        "fixed_s": 2.5711692835094283e-05,
+        "per_flow_s": 1.4928181066534004e-07,
+        "r2": 0.9926951743258724
+      },
+      "benign_false_positive_rate": 0.25585585585585585,
+      "balanced_accuracy": 0.7158097743990756,
+      "parameters": 4904
+    },
+    {
+      "name": "full",
+      "fixed_mi": 1.290782,
+      "mi_per_flow": 0.09873,
+      "memory_mb": 35,
+      "load_s": 0.0025,
+      "recall": {
+        "ddos": 1.0,
+        "dos": 1.0,
+        "mirai": 1.0,
+        "recon": 0.8436,
+        "spoofing": 0.8627,
+        "web": 0.9169,
+        "bruteforce": 0.9087
+      },
+      "context": 16,
+      "eval_rho": 0.5,
+      "recall_clean_context": {
+        "ddos": 1.0,
+        "dos": 1.0,
+        "mirai": 1.0,
+        "recon": 0.8713,
+        "spoofing": 0.905,
+        "web": 0.9679,
+        "bruteforce": 0.9502
+      },
+      "balanced_accuracy_clean_context": 0.8655212244168241,
+      "benign_false_positive_rate_clean_context": 0.10558558558558559,
+      "fit": {
+        "fixed_s": 0.00016134771644169378,
+        "per_flow_s": 1.2341269000219106e-05,
+        "r2": 0.9986923624394649
+      },
+      "benign_false_positive_rate": 0.12684684684684686,
+      "balanced_accuracy": 0.8044084939123766,
+      "parameters": 36296
+    }
+  ],
+  "tiers": {
+    "edge": {
+      "device": "Raspberry Pi 4 Model B, 4 x Cortex-A72 1.5 GHz",
+      "key": "rpi4",
+      "ratio_to_reference_core": 0.3207,
+      "mips": 2566
+    },
+    "fog": {
+      "device": "Apple M2, all 8 cores",
+      "key": "m2-chip",
+      "ratio_to_reference_core": 4.7241,
+      "mips": 37793
+    }
+  },
+  "traffic": {
+    "labels": {
+      "Backdoor_Malware": 4.978668356196856,
+      "BenignTraffic": 17.21050774293616,
+      "BrowserHijacking": 12.925754718144052,
+      "CommandInjection": 8.101178197550894,
+      "DDoS-ACK_Fragmentation": 19.536195701789524,
+      "DDoS-HTTP_Flood": 8.115929017012062,
+      "DDoS-ICMP_Flood": 338.988442576578,
+      "DDoS-ICMP_Fragmentation": 17.91472967547389,
+      "DDoS-PSHACK_FLOOD": 299.1444262178161,
+      "DDoS-RSTFINFLOOD": 311.1270677249462,
+      "DDoS-SYN_Flood": 253.2945226161,
+      "DDoS-SlowLoris": 5.64995578509386,
+      "DDoS-SynonymousIP_Flood": 292.5510218316245,
+      "DDoS-TCP_Flood": 291.8791927627001,
+      "DDoS-UDP_Flood": 293.1644649472286,
+      "DDoS-UDP_Fragmentation": 16.16451617876027,
+      "DNS_Spoofing": 30.780155133826113,
+      "DictionaryBruteForce": 10.640458974278848,
+      "DoS-HTTP_Flood": 18.49454551868281,
+      "DoS-SYN_Flood": 219.68908443327047,
+      "DoS-TCP_Flood": 242.24927804089177,
+      "DoS-UDP_Flood": 203.1336691204959,
+      "MITM-ArpSpoofing": 86.96462782500518,
+      "Mirai-greeth_flood": 47.46781951313362,
+      "Mirai-greip_flood": 40.39996340644636,
+      "Mirai-udpplain": 50.421398088597705,
+      "Recon-HostDiscovery": 24.55070605988513,
+      "Recon-OSScan": 21.327475567216847,
+      "Recon-PingSweep": 13.417508943365224,
+      "Recon-PortScan": 24.424823751640528,
+      "SqlInjection": 7.932294808827395,
+      "Uploading_Attack": 4.584662931933339,
+      "VulnerabilityScan": 8.491559669432196,
+      "XSS": 4.8244273814018115
+    },
+    "class_records_per_s": {
+      "web": 6.4554815825121254,
+      "benign": 17.21050774293616,
+      "ddos": 272.58685768940006,
+      "spoofing": 58.87239147941565,
+      "bruteforce": 10.640458974278848,
+      "dos": 211.41137677688317,
+      "mirai": 47.46781951313362,
+      "recon": 21.327475567216847
+    },
+    "class_ratio": {
+      "web": 0.37508954871838096,
+      "benign": 1.0,
+      "ddos": 15.838397202504382,
+      "spoofing": 3.4207236857134036,
+      "bruteforce": 0.618253635116959,
+      "dos": 12.28385472030332,
+      "mirai": 2.7580720000905377,
+      "recon": 1.2392124558887838
+    }
+  }
+}

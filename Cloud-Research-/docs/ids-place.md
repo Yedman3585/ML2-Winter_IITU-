@@ -1,0 +1,339 @@
+# IDS-PLACE v1: Problem Specification
+
+IDS-PLACE is the scheduling problem studied in this project: **risk-aware online
+placement of deep-learning IDS inference in an edge-fog-cloud tree under attack-driven
+traffic bursts.** This document fixes the problem before any solver is built, so that
+methods are compared on a frozen benchmark rather than the problem being tuned to a
+method. Code: [`problem.py`](../src/fogids/problem.py) (model and instance format) and
+[`generator.py`](../src/fogids/generator.py) (seeded instances).
+
+Status: **v1 draft (milestones M1–M5).** The base configs carry placeholder model
+parameters; the `*-calibrated*` configs carry values measured on CICIoT2023.
+
+## 1. System
+
+- **Topology.** A tree with one cloud root, F fog nodes, and E edge gateways (G per fog).
+  Node m has speed `mips_m`, memory, idle/busy power, a cloud price per 1000 MI, and an
+  uplink to its parent with bandwidth `bw_m` (bytes/s) and latency `lat_m` (s).
+- **Pipeline.** IoT traffic at gateway g is cut into feature windows of length W. Feature
+  extraction runs locally at the gateway. **IDS inference is the only placeable stage.**
+  Alerts are delivered to the cloud and are outside the latency measured in v1.
+- **Models.** A set K of IDS model variants (v1: `light`, `full`). Variant k costs
+  `fixed_mi_k + mi_per_flow_k * flows` MI, needs `memory_k` MB, takes `load_k` s to cold-start
+  on a node where it is not resident, detects attack class c with recall `recall_k[c]`, and
+  flags benign flows as attacks with false-positive rate `fpr_k`.
+
+## 2. Tasks
+
+A task i is one feature window (or a chunk of at most `max_flows_per_task` flows):
+
+| Field | Meaning | Visible to schedulers |
+|---|---|---|
+| `release_s` | features ready at the gateway (absolute time) | yes |
+| `gateway` | originating edge node | yes |
+| `n_flows`, `input_bytes` | size of the window | yes |
+| `deadline_s` | relative deadline from its risk class | yes |
+| `prefilter_score` | noisy attack score in [0, 1] from a cheap pre-filter | yes |
+| `criticality` | weight of the devices behind the gateway | yes |
+| `attack_flows`, `label` | ground truth (dominant class) | **no**, evaluation only |
+
+Risk weight: `w_i = criticality_i * (0.1 + prefilter_score_i)`. Deadline class: short
+(`high_s`) if `prefilter_score_i >= high_risk_threshold`, otherwise long (`low_s`).
+
+## 3. Decisions
+
+Time is divided into epochs of length Δ (v1: 0.1 s). At the end of each epoch the
+scheduler sees the tasks released during it and the system state, and chooses for each
+task one eligible node and one model:
+
+    y[i, m, k] = 1  if task i runs on node m with model k
+
+Eligibility in v1 is the gateway and its ancestors (`gateway -> fog -> cloud`), which is
+what the simulator's tree supports. Lateral fog-to-fog offloading needs links that the
+tree does not have and is deferred. Within a node, tasks share the CPU; how it is shared
+(time sharing, or weighted shares from a NUM layer) is part of the scheduler design.
+
+Constraints: each task gets exactly one (node, model) pair; a model must fit in the
+node's memory (loading a non-resident model costs `load_k` and may evict others).
+
+## 4. Objective and Metrics
+
+The scheduler minimizes, per epoch, a weighted sum of
+
+1. risk-weighted detection latency `Σ w_i T_i`, where `T_i` = release-to-inference-completion
+   time including uplink queueing and CPU sharing;
+2. expected missed detection `Σ w_i (1 - recall_k[class_i])` (estimated from the pre-filter
+   score, since the true class is hidden);
+3. expected false alerts `Σ benign_i · fpr_k`, with benign flows estimated as
+   `n_flows · (1 - prefilter_score)` (`Task.estimated_benign_flows`);
+4. energy of edge and fog nodes, and cloud cost.
+
+Evaluation reports (per risk class): p50/p95/p99 time-to-detect, deadline-miss rate,
+missed detection (fraction of attack flows, per class, and the macro average over the
+attack classes present), false-alert rate (fraction of benign flows flagged), energy,
+cloud cost, and scheduler decision time. Ground truth is used only for evaluation. An
+unfinished task detects nothing and raises no alerts. Decision time is charged to the
+simulation clock.
+
+Both error kinds matter: with the calibrated models, recall on flood attacks is 1.0 for
+both variants, so missed detection alone barely separates them, while `full` halves the
+false alerts of `light` (section 7).
+
+## 5. Instance Generator
+
+Traffic per gateway and window: benign flows ~ Poisson(rate · W · J) with lognormal
+jitter J; each attack burst adds Poisson(flows_per_s · overlap) flows, where the overlap
+integrates a linear ramp-up. Gateway windows are staggered by seeded phases. Attack
+bursts target a seeded subset of gateways. The pre-filter score is the attack fraction
+plus Gaussian noise, clipped to [0, 1].
+
+Reproducibility: all randomness uses only `random.Random.random()` (stable across
+Python versions) and stored floats are rounded to 9 digits. A unit test pins the SHA-256
+of the small instance; it passes on Python 3.10–3.14.
+
+Shipped configurations (placeholders, uncalibrated):
+
+| Config | Fog × gateways | Horizon | Bursts | Tasks | Peak tasks/epoch | Full-model load on edge+fog |
+|---|---|---|---|---|---|---|
+| `ids-place-small` | 2 × 4 | 30 s | DDoS, Recon | 350 | 10 | 0.83 |
+| `ids-place-medium` | 4 × 8 | 60 s | Mirai, DDoS, Recon, Web | 2700 | 21 | 1.04 |
+| `ids-place-large` | 8 × 16 | 60 s | Mirai, DDoS, Recon, Web | 10783 | 69 | 1.24 |
+
+A load above 1 means edge and fog cannot run every window with the full model, so model
+choice and cloud offloading matter. Generate and inspect an instance:
+
+```bash
+fogids generate --config configs/ids-place-small.json      # writes artifacts/instances/
+fogids generate --config configs/ids-place-small.json --seed 7
+fogids describe artifacts/instances/ids-place-small-s11.json
+```
+
+## 6. Online Simulation (milestone M2)
+
+`org.fogids.IdsOnline` builds the instance tree as iFogSim `FogDevice` nodes with one IDS
+module per node, schedules every task release, and wakes at every epoch boundary. When
+tasks were released since the previous epoch, it writes one JSON line to stdout and
+blocks on stdin; simulator logging is redirected to stderr.
+
+```text
+-> {"type":"epoch","t":1.0,"epoch":10,"tasks":[ids],"completed":[[id,finish_s],...],
+    "nodes":{"gw0":{"outstanding":2,"resident":["light"]},...}}
+<- {"assignments":[[id,"fog0","full"],...],"delay_s":0.0}
+-> {"type":"end","t":...,"results":[{"id","node","model","dispatch_s","finish_s","cold_start"},...]}
+```
+
+Rules enforced by the driver: every released task is assigned exactly once, to its
+gateway or an ancestor, with a known model. Assignments take effect after `delay_s`.
+A task released exactly on an epoch boundary belongs to that epoch. A cold start is
+modelled as `load_s` seconds of extra CPU work on the target node, with
+least-recently-used residency within node memory. Inference work and uplink transfers
+use iFogSim's FogDevice queues and CloudSim time sharing, as validated by the analytic
+tests in `tests/test_online.py`.
+
+Python side: [`bridge.py`](../src/fogids/bridge.py) runs the driver and a policy;
+[`policies.py`](../src/fogids/policies.py) holds the reference policies;
+[`metrics.py`](../src/fogids/metrics.py) computes per-class deadline misses, latency
+percentiles over completed tasks (with the unfinished count), expected missed attack
+flows (ground truth used only here), edge and fog energy from executed work under the
+linear power model, and cloud cost. Runs end when all tasks finish or 30 s after the
+last release; unfinished tasks are misses.
+
+First results with uncalibrated placeholder costs (seed as in the shipped configs):
+
+| Instance | Policy | Miss rate (all) | Miss rate (short deadline) | p95 latency, s | Unfinished |
+|---|---|---|---|---|---|
+| small | edge-light | 0.431 | 0.981 | 2.29 | 0 |
+| small | cloud-full | 0.429 | 0.974 | 2.98 | 0 |
+| small | greedy-finish | 0.346 | 0.786 | 0.66 | 0 |
+| medium | cloud-full | 0.875 | 0.998 | 63.0 | 899 |
+| medium | greedy-finish | 0.247 | 0.601 | 0.64 | 0 |
+
+Short-deadline tasks are mostly missed under every baseline: during bursts, a 0.3 s
+deadline is shorter than the edge uplink transfer of large windows. Whether this is a
+property of the problem or of the placeholder parameters is decided by calibration (M4).
+With calibrated parameters (section 7), short deadlines can be met by running `light` at the
+gateway; they become hard only when the more accurate `full` model is wanted.
+
+## 7. Results with Calibrated Models
+
+Calibrated configs (`configs/ids-place-*-calibrated[-x3|-x10].json`, see
+[calibration.md](calibration.md)) use model costs, recalls and false-positive rates measured
+on CICIoT2023 and scale all traffic by x1, x3 or x10. Medium instance, seed 12, decision
+time not charged:
+
+| Load | Policy | Miss rate (all / short) | p95, s | Unfinished | Missed attack (macro) | False alerts |
+|---|---|---|---|---|---|---|
+| x1 | edge-light | 0.000 / 0.000 | 0.10 | 0 | 0.069 | 0.256 |
+| x1 | edge-full | 0.007 / 0.016 | 0.27 | 0 | 0.060 | 0.127 |
+| x1 | greedy-finish | 0.052 / 0.126 | 0.31 | 0 | 0.060 | 0.127 |
+| x3 | edge-light | 0.000 / 0.000 | 0.10 | 0 | 0.069 | 0.256 |
+| x3 | edge-full | 0.532 / 0.906 | 0.67 | 0 | 0.060 | 0.127 |
+| x3 | fog-full | 0.598 / 0.957 | 9.76 | 0 | 0.060 | 0.127 |
+| x3 | greedy-finish | 0.381 / 0.649 | 2.26 | 0 | 0.060 | 0.127 |
+| x10 | edge-light | 0.000 / 0.000 | 0.11 | 0 | 0.069 | 0.256 |
+| x10 | edge-full | 0.666 / 0.991 | 14.80 | 0 | 0.060 | 0.127 |
+| x10 | fog-full | 0.725 / 0.992 | 52.82 | 2219 | 0.321 | 0.097 |
+| x10 | greedy-finish | 0.181 / 0.283 | 2.84 | 0 | 0.060 | 0.136 |
+
+Reading:
+
+- **The trade-off is between timeliness and alert quality.** `light` meets every deadline
+  at every load but flags a quarter of benign flows; `full` halves false alerts and lowers
+  missed detection on the hard classes (recon, spoofing, web, brute force), but no single
+  tier can run it on all windows once traffic grows: at x3 the gateways are saturated
+  (edge-full misses 53 % of deadlines) and offloading is limited by the uplinks.
+- **x1 is nearly trivial** (edge-full almost meets every deadline); **x3 and x10 are the
+  main regimes** for the benchmark. Results should be reported as a function of load.
+- **The greedy baseline is weak**: its latency estimate ignores uplink queues, so it sends
+  work to saturated links (and is better at x10 than at x3 on this seed). Queue-aware
+  baselines are part of M3.
+- The false-alert rate of an unfinished task is zero by definition, so an overloaded policy
+  can look better on that column (fog-full at x10); read it together with unfinished tasks.
+
+## 8. Baselines and Multi-Seed Results (milestone M3)
+
+Reference policies ([`policies.py`](../src/fogids/policies.py)); all see only
+scheduler-visible information:
+
+| Policy | Rule |
+|---|---|
+| `edge-light`, `edge-full`, `fog-full`, `cloud-full` | Every window to one tier with one model |
+| `greedy-finish` | Highest risk weight first; best model whose queue-free latency estimate (CPU backlog only) meets the deadline |
+| `edge-adaptive` | Never offloads; best model at the gateway predicted to meet the deadline, else the fastest |
+| `queue-greedy` | Like `greedy-finish` over all eligible nodes, with a queue-aware estimate |
+| `risk-split` | Short-deadline windows: fastest model at the gateway; others: best model on the node predicted to finish first (queue-aware) |
+| `random` | Uniform eligible node and model, seeded |
+
+The queue-aware estimate (`QueueModel`) treats each uplink as a FIFO queue (serialization
+then propagation, as in the simulator) and each CPU as a fluid backlog that drains at the
+node's MIPS; it predicts cold starts from tracked residency. It is built only from the
+policy's own decisions.
+
+`fogids sweep` runs every (config, seed, policy) combination in parallel and aggregates
+across seeds (mean and 95 % Student-t interval); it writes `runs.csv`, `summary.csv`,
+`summary.md` and figures (`pip install -e '.[analysis]'` for matplotlib).
+
+```bash
+fogids sweep --name m3-medium --seeds 5 \
+  --config configs/ids-place-medium-calibrated.json \
+  --config configs/ids-place-medium-calibrated-x3.json \
+  --config configs/ids-place-medium-calibrated-x10.json \
+  --policy edge-light --policy edge-full --policy fog-full --policy cloud-full \
+  --policy greedy-finish --policy edge-adaptive --policy queue-greedy --policy risk-split --policy random
+```
+
+Medium instance, calibrated models, 5 seeds (1–5), decision time not charged. Mean ±
+95 % interval; intervals of 0.000 mean the value did not vary across seeds.
+
+| Load | Policy | Miss rate (all) | Miss rate (short) | False alerts | Missed attack (macro) |
+|---|---|---|---|---|---|
+| x3 | edge-light | 0.000 ± 0.000 | 0.000 ± 0.000 | 0.256 | 0.069 |
+| x3 | edge-full | 0.536 ± 0.008 | 0.909 ± 0.010 | 0.127 | 0.060 |
+| x3 | greedy-finish | 0.409 ± 0.018 | 0.693 ± 0.031 | 0.127 | 0.060 |
+| x3 | edge-adaptive | 0.056 ± 0.013 | 0.095 ± 0.022 | 0.134 | 0.060 |
+| x3 | queue-greedy | 0.053 ± 0.012 | 0.090 ± 0.021 | 0.133 | 0.060 |
+| x3 | risk-split | 0.000 ± 0.000 | 0.000 ± 0.000 | 0.145 | 0.059 |
+| x3 | random | 0.371 ± 0.008 | 0.622 ± 0.016 | 0.192 | 0.065 |
+| x10 | edge-light | 0.000 ± 0.000 | 0.000 ± 0.000 | 0.256 | 0.069 |
+| x10 | edge-full | 0.666 ± 0.006 | 0.990 ± 0.006 | 0.127 | 0.060 |
+| x10 | greedy-finish | 0.172 ± 0.011 | 0.270 ± 0.016 | 0.136 | 0.060 |
+| x10 | edge-adaptive | 0.063 ± 0.005 | 0.099 ± 0.008 | 0.140 | 0.060 |
+| x10 | queue-greedy | 0.055 ± 0.005 | 0.086 ± 0.008 | 0.139 | 0.060 |
+| x10 | risk-split | 0.000 ± 0.000 | 0.000 ± 0.000 | 0.145 | 0.059 |
+| x10 | random | 0.562 ± 0.005 | 0.787 ± 0.007 | 0.192 | 0.064 |
+
+At x1, `queue-greedy` already meets every deadline with the full model on every window
+(false alerts 0.127). Fog-only and cloud-only placement saturate the uplinks (at x10 about
+2 230 windows never finish).
+
+![Deadline misses against load](figures/ids-place-medium-miss-vs-load.png)
+
+![Timeliness against alert quality at x10](figures/ids-place-medium-x10-tradeoff.png)
+
+Findings:
+
+1. **Queue awareness is what matters among the greedy rules.** With the same decision
+   rule, the queue-aware estimate cuts deadline misses from 0.41 to 0.05 at x3.
+2. **`risk-split` meets every deadline at every load** and keeps false alerts at 0.145,
+   because the windows that need speed (high pre-filter score) are mostly attack traffic,
+   where the cheap model loses little. `edge-light` meets every deadline too, at 0.256.
+3. **The remaining headroom is narrow.** The best conceivable point is every deadline met
+   with false alerts at the full model's rate (0.127). The best baseline (`risk-split`) is
+   1.8 points above it, and the queue-aware greedy rules trade about 5 % deadline misses
+   for 1.2 points. How much of this gap an optimizer can close, and whether the scenario
+   needs to be harder (one gateway core for IDS, a heavier third model, more short-deadline
+   traffic) to leave room for one, is the question for M5 (per-epoch exact oracle).
+
+## 9. Headroom and Estimate Fidelity (milestone M5)
+
+`fogids oracle` ([`bounds.py`](../src/fogids/bounds.py), [`oracle.py`](../src/fogids/oracle.py))
+answers two questions on each instance.
+
+**How good can any policy be?** A clairvoyant linear-programming relaxation over the whole
+horizon: fractional placement x[i, m, k] for options whose queue-free transfer plus exclusive
+compute fits the deadline, a give-up variable per task, and capacity constraints for every
+CPU and uplink over a set of time intervals (a grid, every task window, and windows grown
+from each window start). These are necessary conditions, so the optimum is a lower bound on
+the false-alert rate at a given deadline-miss rate; it is optimistic (fluid work, no queue
+order, only some intervals). Replaying the LP plan in the simulator (`lp-plan`) shows how
+optimistic: it misses 31 % of deadlines at x3 and 12 % at x10.
+
+**How well do scheduler estimates predict the simulator?** Every queue-aware policy and
+`greedy-finish` record the finish time they predicted for each task; we compare with the
+simulated finish (Spearman rank correlation of latencies, agreement on meeting the deadline,
+and broken promises: predicted to meet, actually missed).
+
+Medium instance, calibrated models, seeds 1–3, decision time not charged:
+
+| Load | Policy | Miss rate | False alerts | Latency rank corr. | Broken promises |
+|---|---|---|---|---|---|
+| x1 | fluid bound | 0 | 0.1268 | — | — |
+| x1 | queue-greedy | 0.000 | 0.1268 | 0.90 | 0.000 |
+| x1 | risk-split | 0.000 | 0.1449 | 1.00 | 0.000 |
+| x3 | fluid bound | 0 | 0.1308 | — | — |
+| x3 | queue-greedy | 0.055 | 0.1331 | 0.05 | 0.056 |
+| x3 | edge-adaptive | 0.057 | 0.1344 | −0.05 | 0.059 |
+| x3 | greedy-finish (queue-free) | 0.410 | 0.1268 | 0.92 | 0.310 |
+| x3 | risk-split | 0.000 | 0.1452 | 0.96 | 0.000 |
+| x10 | fluid bound | 0 | 0.1374 | — | — |
+| x10 | queue-greedy | 0.052 | 0.1386 | −0.57 | 0.057 |
+| x10 | edge-adaptive | 0.061 | 0.1394 | −0.58 | 0.071 |
+| x10 | greedy-finish (queue-free) | 0.177 | 0.1360 | −0.26 | 0.171 |
+| x10 | risk-split | 0.000 | 0.1452 | 0.88 | 0.000 |
+
+Findings:
+
+1. **x1 is solved**: `queue-greedy` reaches the bound (every deadline met, every window on
+   the full model).
+2. **The headroom over the best baseline is small.** At equal (zero) deadline misses,
+   `risk-split` is at most 1.4 points of false alerts above the bound at x3 and 0.8 points
+   at x10, and the true gap is smaller because the bound is optimistic.
+3. **Hand-built estimates break exactly where decisions matter.** Under load, the
+   queue-aware estimate's latency ranking is uncorrelated or inversely correlated with the
+   simulator (−0.57 at x10), and every deadline miss of `queue-greedy` and `edge-adaptive` is
+   a broken promise. The cause is processor sharing: tasks that arrive later slow down
+   tasks already running, which a scheduler-side queue model does not see. `risk-split`
+   predicts well only because it keeps short-deadline work on the cheap model. A policy
+   with an accurate latency model could keep queue-greedy's false-alert rate (about 1 point
+   below `risk-split`) without its misses, but it would gain at most the remaining 1 point.
+4. **Consequence for the method.** On the calibrated scenario a learned scheduler can gain
+   about one point of false alerts. A stronger case for learning needs a scenario where
+   simple rules leave more on the table: one gateway core for IDS instead of four, a heavier
+   third model, more short-deadline benign traffic, or lateral fog offloading.
+
+```bash
+pip install -e '.[analysis]'          # scipy for the LP, matplotlib for figures
+fogids oracle --name m5 --seeds 3 \
+  --config configs/ids-place-medium-calibrated.json \
+  --config configs/ids-place-medium-calibrated-x3.json \
+  --config configs/ids-place-medium-calibrated-x10.json
+```
+
+## 10. Open Points for v1 Freeze
+
+- Whether a scheduler may re-plan tasks that were placed but have not started (this
+  enlarges the per-epoch decision and is relevant for QUBO size).
+- Model eviction policy when memory is full.
+- Trace-driven arrivals from CICIoT2023 in addition to the synthetic bursts.
+- A single scalar score for comparing policies (weights of latency, missed detection and
+  false alerts), or reporting Pareto fronts instead.
